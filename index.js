@@ -141,6 +141,10 @@ setInterval(() => {
 /* =========================
    HELPERS
 ========================= */
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function formatUser(user) {
   return user ? `${user.tag} (${user.id})` : "Bilinmiyor";
 }
@@ -153,11 +157,19 @@ function getAvatar(entity) {
   if (!entity) return null;
 
   if (typeof entity.displayAvatarURL === "function") {
-    return entity.displayAvatarURL({ size: 512, extension: "png", forceStatic: true });
+    return entity.displayAvatarURL({
+      size: 512,
+      extension: "png",
+      forceStatic: true
+    });
   }
 
   if (entity.user && typeof entity.user.displayAvatarURL === "function") {
-    return entity.user.displayAvatarURL({ size: 512, extension: "png", forceStatic: true });
+    return entity.user.displayAvatarURL({
+      size: 512,
+      extension: "png",
+      forceStatic: true
+    });
   }
 
   return null;
@@ -180,21 +192,87 @@ async function sendLog(guild, logName, embed) {
   await channel.send({ embeds: [embed] }).catch(() => null);
 }
 
-async function fetchAuditEntry(guild, type, targetId) {
-  try {
-    const logs = await guild.fetchAuditLogs({ type, limit: 10 });
-    const now = Date.now();
+function extractChangedRoleIds(changes = []) {
+  const ids = new Set();
 
-    return logs.entries.find((entry) => {
-      const entryTargetId = entry.target?.id || entry.targetId;
-      return (
-        String(entryTargetId) === String(targetId) &&
-        now - entry.createdTimestamp < 15000
-      );
-    }) || null;
-  } catch {
-    return null;
+  for (const change of changes) {
+    if (!change) continue;
+
+    if (change.key === "$add" || change.key === "$remove") {
+      const roles = Array.isArray(change.new)
+        ? change.new
+        : Array.isArray(change.old)
+          ? change.old
+          : [];
+
+      for (const role of roles) {
+        if (role?.id) ids.add(String(role.id));
+      }
+    }
   }
+
+  return [...ids];
+}
+
+async function fetchAuditEntry(guild, type, targetId, options = {}) {
+  const {
+    limit = 10,
+    maxAgeMs = 15000,
+    retries = 1,
+    retryDelay = 0,
+    matcher = null
+  } = options;
+
+  for (let attempt = 0; attempt < retries; attempt++) {
+    try {
+      const logs = await guild.fetchAuditLogs({ type, limit });
+      const now = Date.now();
+
+      const entry = logs.entries.find((entry) => {
+        const entryTargetId = entry.target?.id || entry.targetId;
+        const recent = now - entry.createdTimestamp < maxAgeMs;
+        const sameTarget =
+          targetId == null ? true : String(entryTargetId) === String(targetId);
+
+        if (!recent || !sameTarget) return false;
+        if (typeof matcher === "function" && !matcher(entry)) return false;
+
+        return true;
+      });
+
+      if (entry) return entry;
+    } catch {}
+
+    if (attempt < retries - 1 && retryDelay > 0) {
+      await sleep(retryDelay);
+    }
+  }
+
+  return null;
+}
+
+async function fetchRoleUpdateAuditEntry(guild, memberId, changedRoleIds = []) {
+  return fetchAuditEntry(guild, AuditLogEvent.MemberRoleUpdate, memberId, {
+    limit: 20,
+    maxAgeMs: 30000,
+    retries: 5,
+    retryDelay: 1200,
+    matcher: (entry) => {
+      if (!changedRoleIds.length) return true;
+
+      const changedInEntry = extractChangedRoleIds(entry.changes || []);
+      return changedRoleIds.some((id) => changedInEntry.includes(String(id)));
+    }
+  });
+}
+
+async function fetchMemberUpdateAuditEntry(guild, memberId) {
+  return fetchAuditEntry(guild, AuditLogEvent.MemberUpdate, memberId, {
+    limit: 20,
+    maxAgeMs: 30000,
+    retries: 5,
+    retryDelay: 1200
+  });
 }
 
 async function fetchMessageDeleteAudit(guild, message) {
@@ -207,9 +285,13 @@ async function fetchMessageDeleteAudit(guild, message) {
     const now = Date.now();
 
     const entry = logs.entries.find((entry) => {
-      const sameTarget = String(entry.target?.id || "") === String(message.author?.id || "");
-      const sameChannel = String(entry.extra?.channel?.id || "") === String(message.channel?.id || "");
+      const sameTarget =
+        String(entry.target?.id || "") === String(message.author?.id || "");
+      const sameChannel =
+        String(entry.extra?.channel?.id || "") ===
+        String(message.channel?.id || "");
       const recent = now - entry.createdTimestamp < 15000;
+
       return sameTarget && sameChannel && recent;
     });
 
@@ -676,7 +758,13 @@ client.on("messageCreate", async (message) => {
 client.on("channelCreate", async (channel) => {
   if (!channel.guild) return;
 
-  const entry = await fetchAuditEntry(channel.guild, AuditLogEvent.ChannelCreate, channel.id);
+  const entry = await fetchAuditEntry(channel.guild, AuditLogEvent.ChannelCreate, channel.id, {
+    limit: 10,
+    maxAgeMs: 20000,
+    retries: 3,
+    retryDelay: 1000
+  });
+
   const executor = entry?.executor || null;
   const unauthorized = executor && !executor.bot && !isWhitelisted(executor.id);
 
@@ -705,7 +793,13 @@ client.on("channelCreate", async (channel) => {
 client.on("channelDelete", async (channel) => {
   if (!channel.guild) return;
 
-  const entry = await fetchAuditEntry(channel.guild, AuditLogEvent.ChannelDelete, channel.id);
+  const entry = await fetchAuditEntry(channel.guild, AuditLogEvent.ChannelDelete, channel.id, {
+    limit: 10,
+    maxAgeMs: 20000,
+    retries: 3,
+    retryDelay: 1000
+  });
+
   const executor = entry?.executor || null;
   const unauthorized = executor && !executor.bot && !isWhitelisted(executor.id);
 
@@ -733,7 +827,13 @@ client.on("channelDelete", async (channel) => {
 client.on("channelUpdate", async (oldChannel, newChannel) => {
   if (!newChannel.guild) return;
 
-  const entry = await fetchAuditEntry(newChannel.guild, AuditLogEvent.ChannelUpdate, newChannel.id);
+  const entry = await fetchAuditEntry(newChannel.guild, AuditLogEvent.ChannelUpdate, newChannel.id, {
+    limit: 10,
+    maxAgeMs: 20000,
+    retries: 3,
+    retryDelay: 1000
+  });
+
   const executor = entry?.executor || null;
   const changes = channelChanges(oldChannel, newChannel);
   const unauthorized = executor && !executor.bot && !isWhitelisted(executor.id);
@@ -776,7 +876,13 @@ client.on("channelUpdate", async (oldChannel, newChannel) => {
    ROLE GUARD + LOG
 ========================= */
 client.on("roleCreate", async (role) => {
-  const entry = await fetchAuditEntry(role.guild, AuditLogEvent.RoleCreate, role.id);
+  const entry = await fetchAuditEntry(role.guild, AuditLogEvent.RoleCreate, role.id, {
+    limit: 10,
+    maxAgeMs: 20000,
+    retries: 3,
+    retryDelay: 1000
+  });
+
   const executor = entry?.executor || null;
   const unauthorized = executor && !executor.bot && !isWhitelisted(executor.id);
 
@@ -802,7 +908,13 @@ client.on("roleCreate", async (role) => {
 });
 
 client.on("roleDelete", async (role) => {
-  const entry = await fetchAuditEntry(role.guild, AuditLogEvent.RoleDelete, role.id);
+  const entry = await fetchAuditEntry(role.guild, AuditLogEvent.RoleDelete, role.id, {
+    limit: 10,
+    maxAgeMs: 20000,
+    retries: 3,
+    retryDelay: 1000
+  });
+
   const executor = entry?.executor || null;
   const unauthorized = executor && !executor.bot && !isWhitelisted(executor.id);
 
@@ -828,7 +940,13 @@ client.on("roleDelete", async (role) => {
 });
 
 client.on("roleUpdate", async (oldRole, newRole) => {
-  const entry = await fetchAuditEntry(newRole.guild, AuditLogEvent.RoleUpdate, newRole.id);
+  const entry = await fetchAuditEntry(newRole.guild, AuditLogEvent.RoleUpdate, newRole.id, {
+    limit: 10,
+    maxAgeMs: 20000,
+    retries: 3,
+    retryDelay: 1000
+  });
+
   const executor = entry?.executor || null;
   const unauthorized = executor && !executor.bot && !isWhitelisted(executor.id);
   const changes = roleChanges(oldRole, newRole);
@@ -880,7 +998,17 @@ client.on("guildMemberUpdate", async (oldMember, newMember) => {
   );
 
   if (addedRoles.size || removedRoles.size) {
-    const entry = await fetchAuditEntry(newMember.guild, AuditLogEvent.MemberRoleUpdate, newMember.id);
+    const changedRoleIds = [
+      ...addedRoles.map((role) => role.id),
+      ...removedRoles.map((role) => role.id)
+    ];
+
+    const entry = await fetchRoleUpdateAuditEntry(
+      newMember.guild,
+      newMember.id,
+      changedRoleIds
+    );
+
     const executor = entry?.executor || null;
 
     for (const role of addedRoles.values()) {
@@ -928,7 +1056,7 @@ client.on("guildMemberUpdate", async (oldMember, newMember) => {
   const newTimeout = newMember.communicationDisabledUntilTimestamp || null;
 
   if (oldTimeout !== newTimeout) {
-    const entry = await fetchAuditEntry(newMember.guild, AuditLogEvent.MemberUpdate, newMember.id);
+    const entry = await fetchMemberUpdateAuditEntry(newMember.guild, newMember.id);
     const executor = entry?.executor || null;
     const isTimeoutAdded = Boolean(newTimeout && (!oldTimeout || newTimeout > oldTimeout));
 
@@ -953,7 +1081,13 @@ client.on("guildMemberUpdate", async (oldMember, newMember) => {
    BAN / KICK GUARD + LOG
 ========================= */
 client.on("guildBanAdd", async (ban) => {
-  const entry = await fetchAuditEntry(ban.guild, AuditLogEvent.MemberBanAdd, ban.user.id);
+  const entry = await fetchAuditEntry(ban.guild, AuditLogEvent.MemberBanAdd, ban.user.id, {
+    limit: 10,
+    maxAgeMs: 20000,
+    retries: 3,
+    retryDelay: 1000
+  });
+
   const executor = entry?.executor || null;
   const reason = entry?.reason || "Sebep belirtilmedi.";
 
@@ -978,7 +1112,13 @@ client.on("guildBanAdd", async (ban) => {
 });
 
 client.on("guildMemberRemove", async (member) => {
-  const entry = await fetchAuditEntry(member.guild, AuditLogEvent.MemberKick, member.id);
+  const entry = await fetchAuditEntry(member.guild, AuditLogEvent.MemberKick, member.id, {
+    limit: 10,
+    maxAgeMs: 15000,
+    retries: 2,
+    retryDelay: 700
+  });
+
   if (!entry) return;
 
   const executor = entry.executor || null;
@@ -1010,23 +1150,28 @@ client.on("messageDelete", async (message) => {
   if (!message.guild) return;
 
   let fetched = message;
-  let cachedData = messageCache.get(message.id) || null;
+  const cachedData = messageCache.get(message.id) || null;
 
   if (fetched.partial) {
     try {
       fetched = await fetched.fetch();
-    } catch {
-      // fetch edilemeyebilir, cache ile devam edeceğiz
-    }
+    } catch {}
   }
 
-  const author = fetched.author || (cachedData ? { tag: cachedData.authorTag, id: cachedData.authorId } : null);
+  const author =
+    fetched.author ||
+    (cachedData
+      ? { tag: cachedData.authorTag, id: cachedData.authorId }
+      : null);
+
   if (author?.bot) return;
 
-  const deleterEntry = author ? await fetchMessageDeleteAudit(message.guild, {
-    author,
-    channel: fetched.channel || message.channel
-  }) : null;
+  const deleterEntry = author
+    ? await fetchMessageDeleteAudit(message.guild, {
+        author,
+        channel: fetched.channel || message.channel
+      })
+    : null;
 
   const deleter = deleterEntry?.executor || null;
 
@@ -1036,8 +1181,8 @@ client.on("messageDelete", async (message) => {
     "İçerik alınamadı.";
 
   const attachments = [
-    ...(fetched.attachments?.map((a) => a.url) || []),
-    ...((cachedData?.attachments || []))
+    ...(fetched.attachments ? [...fetched.attachments.values()].map((a) => a.url) : []),
+    ...(cachedData?.attachments || [])
   ];
 
   const uniqueAttachments = [...new Set(attachments)];
@@ -1096,7 +1241,13 @@ client.on("voiceStateUpdate", async (oldState, newState) => {
   if (!guild) return;
 
   if (oldState.channelId && !newState.channelId) {
-    const entry = await fetchAuditEntry(guild, AuditLogEvent.MemberDisconnect, oldState.id);
+    const entry = await fetchAuditEntry(guild, AuditLogEvent.MemberDisconnect, oldState.id, {
+      limit: 10,
+      maxAgeMs: 15000,
+      retries: 2,
+      retryDelay: 700
+    });
+
     const executor = entry?.executor || null;
 
     const embed = new EmbedBuilder()
