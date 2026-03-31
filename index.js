@@ -108,6 +108,37 @@ function isWhitelisted(userId) {
 }
 
 /* =========================
+   MESSAGE CACHE
+========================= */
+const messageCache = new Map();
+const MESSAGE_CACHE_TTL = 1000 * 60 * 60; // 1 saat
+
+function cacheMessage(message) {
+  if (!message || !message.id) return;
+
+  messageCache.set(message.id, {
+    id: message.id,
+    guildId: message.guild?.id || null,
+    channelId: message.channel?.id || null,
+    channelName: message.channel?.name || null,
+    authorId: message.author?.id || null,
+    authorTag: message.author?.tag || "Bilinmiyor",
+    content: message.content || "",
+    attachments: [...message.attachments.values()].map((a) => a.url),
+    createdTimestamp: message.createdTimestamp || Date.now()
+  });
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, data] of messageCache.entries()) {
+    if (now - (data.createdTimestamp || now) > MESSAGE_CACHE_TTL) {
+      messageCache.delete(id);
+    }
+  }
+}, 5 * 60 * 1000);
+
+/* =========================
    HELPERS
 ========================= */
 function formatUser(user) {
@@ -133,7 +164,7 @@ function getAvatar(entity) {
 }
 
 function truncate(text, max = 1000) {
-  if (!text) return "Yok";
+  if (!text) return "İçerik alınamadı.";
   return text.length > max ? `${text.slice(0, max - 3)}...` : text;
 }
 
@@ -161,6 +192,28 @@ async function fetchAuditEntry(guild, type, targetId) {
         now - entry.createdTimestamp < 15000
       );
     }) || null;
+  } catch {
+    return null;
+  }
+}
+
+async function fetchMessageDeleteAudit(guild, message) {
+  try {
+    const logs = await guild.fetchAuditLogs({
+      type: AuditLogEvent.MessageDelete,
+      limit: 10
+    });
+
+    const now = Date.now();
+
+    const entry = logs.entries.find((entry) => {
+      const sameTarget = String(entry.target?.id || "") === String(message.author?.id || "");
+      const sameChannel = String(entry.extra?.channel?.id || "") === String(message.channel?.id || "");
+      const recent = now - entry.createdTimestamp < 15000;
+      return sameTarget && sameChannel && recent;
+    });
+
+    return entry || null;
   } catch {
     return null;
   }
@@ -374,6 +427,19 @@ client.once("ready", async () => {
       console.error("Otomatik ses kanalına bağlanırken hata:", error);
     }
   }
+});
+
+/* =========================
+   MESSAGE CACHE EVENTS
+========================= */
+client.on("messageCreate", (message) => {
+  if (!message.guild || message.author?.bot) return;
+  cacheMessage(message);
+});
+
+client.on("messageUpdate", (_, newMessage) => {
+  if (!newMessage.guild || newMessage.author?.bot) return;
+  cacheMessage(newMessage);
 });
 
 /* =========================
@@ -941,21 +1007,65 @@ client.on("guildMemberRemove", async (member) => {
    MESSAGE LOG
 ========================= */
 client.on("messageDelete", async (message) => {
-  if (!message.guild || message.author?.bot) return;
+  if (!message.guild) return;
+
+  let fetched = message;
+  let cachedData = messageCache.get(message.id) || null;
+
+  if (fetched.partial) {
+    try {
+      fetched = await fetched.fetch();
+    } catch {
+      // fetch edilemeyebilir, cache ile devam edeceğiz
+    }
+  }
+
+  const author = fetched.author || (cachedData ? { tag: cachedData.authorTag, id: cachedData.authorId } : null);
+  if (author?.bot) return;
+
+  const deleterEntry = author ? await fetchMessageDeleteAudit(message.guild, {
+    author,
+    channel: fetched.channel || message.channel
+  }) : null;
+
+  const deleter = deleterEntry?.executor || null;
+
+  const content =
+    fetched.content ||
+    cachedData?.content ||
+    "İçerik alınamadı.";
+
+  const attachments = [
+    ...(fetched.attachments?.map((a) => a.url) || []),
+    ...((cachedData?.attachments || []))
+  ];
+
+  const uniqueAttachments = [...new Set(attachments)];
+
+  const desc = [
+    `**Mesaj atan:** ${author ? `${author.tag} (${author.id})` : "Bilinmiyor"}`,
+    `**Mesajı silen:** ${formatUser(deleter)}`,
+    `**Kanal:** ${fetched.channel || message.channel}`,
+    `**Silinen mesaj:**`,
+    truncate(content)
+  ];
+
+  if (uniqueAttachments.length) {
+    desc.push("");
+    desc.push(`**Ekler:**`);
+    desc.push(uniqueAttachments.slice(0, 5).join("\n"));
+  }
 
   const embed = new EmbedBuilder()
     .setColor(COLORS.red)
     .setTitle("Mesaj Silindi")
-    .setDescription([
-      `**Mesaj atan:** ${message.author ? `${message.author.tag} (${message.author.id})` : "Bilinmiyor"}`,
-      `**Kanal:** ${message.channel}`,
-      `**Silinen mesaj:**`,
-      truncate(message.content || "İçerik alınamadı.")
-    ].join("\n"))
-    .setThumbnail(getAvatar(message.author))
+    .setDescription(desc.join("\n"))
+    .setThumbnail(getAvatar(fetched.author || null))
     .setTimestamp();
 
   await sendLog(message.guild, SETTINGS.messageLogName, embed);
+
+  messageCache.delete(message.id);
 });
 
 client.on("messageDeleteBulk", async (messages) => {
@@ -972,6 +1082,10 @@ client.on("messageDeleteBulk", async (messages) => {
     .setTimestamp();
 
   await sendLog(first.guild, SETTINGS.messageLogName, embed);
+
+  for (const msg of messages.values()) {
+    messageCache.delete(msg.id);
+  }
 });
 
 /* =========================
