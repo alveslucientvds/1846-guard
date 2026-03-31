@@ -111,7 +111,7 @@ function isWhitelisted(userId) {
    MESSAGE CACHE
 ========================= */
 const messageCache = new Map();
-const MESSAGE_CACHE_TTL = 1000 * 60 * 60; // 1 saat
+const MESSAGE_CACHE_TTL = 1000 * 60 * 60;
 
 function cacheMessage(message) {
   if (!message || !message.id) return;
@@ -216,14 +216,18 @@ function extractChangedRoleIds(changes = []) {
 
 async function fetchAuditEntry(guild, type, targetId, options = {}) {
   const {
-    limit = 10,
-    maxAgeMs = 15000,
-    retries = 1,
-    retryDelay = 0,
+    limit = 20,
+    maxAgeMs = 30000,
+    retries = 6,
+    retryDelay = 1500,
     matcher = null
   } = options;
 
   for (let attempt = 0; attempt < retries; attempt++) {
+    if (attempt > 0) {
+      await sleep(retryDelay);
+    }
+
     try {
       const logs = await guild.fetchAuditLogs({ type, limit });
       const now = Date.now();
@@ -242,10 +246,6 @@ async function fetchAuditEntry(guild, type, targetId, options = {}) {
 
       if (entry) return entry;
     } catch {}
-
-    if (attempt < retries - 1 && retryDelay > 0) {
-      await sleep(retryDelay);
-    }
   }
 
   return null;
@@ -255,11 +255,10 @@ async function fetchRoleUpdateAuditEntry(guild, memberId, changedRoleIds = []) {
   return fetchAuditEntry(guild, AuditLogEvent.MemberRoleUpdate, memberId, {
     limit: 20,
     maxAgeMs: 30000,
-    retries: 5,
-    retryDelay: 1200,
+    retries: 6,
+    retryDelay: 1500,
     matcher: (entry) => {
       if (!changedRoleIds.length) return true;
-
       const changedInEntry = extractChangedRoleIds(entry.changes || []);
       return changedRoleIds.some((id) => changedInEntry.includes(String(id)));
     }
@@ -270,8 +269,8 @@ async function fetchMemberUpdateAuditEntry(guild, memberId) {
   return fetchAuditEntry(guild, AuditLogEvent.MemberUpdate, memberId, {
     limit: 20,
     maxAgeMs: 30000,
-    retries: 5,
-    retryDelay: 1200
+    retries: 6,
+    retryDelay: 1500
   });
 }
 
@@ -310,6 +309,26 @@ async function banMemberSafe(guild, userId, reason) {
   }
 }
 
+function permissionDiff(oldPerms, newPerms) {
+  const changed = [];
+  const oldArr = [...oldPerms.toArray()];
+  const newArr = [...newPerms.toArray()];
+
+  const added = newArr.filter((perm) => !oldArr.includes(perm));
+  const removed = oldArr.filter((perm) => !newArr.includes(perm));
+
+  if (added.length) changed.push(`Eklenen izinler: ${added.join(", ")}`);
+  if (removed.length) changed.push(`Kaldırılan izinler: ${removed.join(", ")}`);
+
+  return changed;
+}
+
+function overwriteTypeName(type) {
+  if (type === 0) return "Rol";
+  if (type === 1) return "Üye";
+  return "Bilinmiyor";
+}
+
 function channelChanges(oldChannel, newChannel) {
   const changes = [];
 
@@ -318,10 +337,12 @@ function channelChanges(oldChannel, newChannel) {
   }
 
   if ((oldChannel.topic || "") !== (newChannel.topic || "")) {
-    changes.push("Konu değiştirildi.");
+    changes.push(
+      `Konu: **${oldChannel.topic || "Yok"}** → **${newChannel.topic || "Yok"}**`
+    );
   }
 
-  if (oldChannel.nsfw !== newChannel.nsfw) {
+  if ((oldChannel.nsfw ?? false) !== (newChannel.nsfw ?? false)) {
     changes.push(
       `NSFW: **${oldChannel.nsfw ? "Açık" : "Kapalı"}** → **${newChannel.nsfw ? "Açık" : "Kapalı"}**`
     );
@@ -334,7 +355,9 @@ function channelChanges(oldChannel, newChannel) {
   }
 
   if ((oldChannel.bitrate || 0) !== (newChannel.bitrate || 0)) {
-    changes.push(`Bitrate: **${oldChannel.bitrate || 0}** → **${newChannel.bitrate || 0}**`);
+    changes.push(
+      `Bitrate: **${oldChannel.bitrate || 0}** → **${newChannel.bitrate || 0}**`
+    );
   }
 
   if ((oldChannel.userLimit || 0) !== (newChannel.userLimit || 0)) {
@@ -344,8 +367,69 @@ function channelChanges(oldChannel, newChannel) {
   }
 
   if ((oldChannel.parentId || "Yok") !== (newChannel.parentId || "Yok")) {
-    changes.push("Kategori değiştirildi.");
+    const oldParent = oldChannel.parent?.name || "Yok";
+    const newParent = newChannel.parent?.name || "Yok";
+    changes.push(`Kategori: **${oldParent}** → **${newParent}**`);
   }
+
+  if ((oldChannel.position ?? 0) !== (newChannel.position ?? 0)) {
+    changes.push(
+      `Pozisyon: **${oldChannel.position ?? 0}** → **${newChannel.position ?? 0}**`
+    );
+  }
+
+  if ((oldChannel.defaultAutoArchiveDuration || 0) !== (newChannel.defaultAutoArchiveDuration || 0)) {
+    changes.push(
+      `Otomatik arşiv süresi: **${oldChannel.defaultAutoArchiveDuration || 0}** → **${newChannel.defaultAutoArchiveDuration || 0}**`
+    );
+  }
+
+  if ((oldChannel.rtcRegion || "Otomatik") !== (newChannel.rtcRegion || "Otomatik")) {
+    changes.push(
+      `RTC Bölgesi: **${oldChannel.rtcRegion || "Otomatik"}** → **${newChannel.rtcRegion || "Otomatik"}**`
+    );
+  }
+
+  if ((oldChannel.videoQualityMode || 1) !== (newChannel.videoQualityMode || 1)) {
+    changes.push(
+      `Video kalite modu: **${oldChannel.videoQualityMode || 1}** → **${newChannel.videoQualityMode || 1}**`
+    );
+  }
+
+  try {
+    const oldOverwrites = oldChannel.permissionOverwrites?.cache || new Map();
+    const newOverwrites = newChannel.permissionOverwrites?.cache || new Map();
+
+    for (const [id, newOverwrite] of newOverwrites) {
+      const oldOverwrite = oldOverwrites.get(id);
+
+      if (!oldOverwrite) {
+        changes.push(
+          `İzin eklendi: **${overwriteTypeName(newOverwrite.type)} ${id}** için kanal izni oluşturuldu.`
+        );
+        continue;
+      }
+
+      const permChanges = permissionDiff(oldOverwrite.allow, newOverwrite.allow);
+      const denyChanges = permissionDiff(oldOverwrite.deny, newOverwrite.deny);
+
+      for (const item of permChanges) {
+        changes.push(`İzin güncellendi (${id}): ${item}`);
+      }
+
+      for (const item of denyChanges) {
+        changes.push(`Engel güncellendi (${id}): ${item}`);
+      }
+    }
+
+    for (const [id, oldOverwrite] of oldOverwrites) {
+      if (!newOverwrites.has(id)) {
+        changes.push(
+          `İzin silindi: **${overwriteTypeName(oldOverwrite.type)} ${id}** için kanal izni kaldırıldı.`
+        );
+      }
+    }
+  } catch {}
 
   return changes.length ? changes : ["Kanal ayarlarında değişiklik yapıldı."];
 }
@@ -358,7 +442,7 @@ function roleChanges(oldRole, newRole) {
   }
 
   if (oldRole.color !== newRole.color) {
-    changes.push("Renk değiştirildi.");
+    changes.push(`Renk: **${oldRole.hexColor}** → **${newRole.hexColor}**`);
   }
 
   if (oldRole.hoist !== newRole.hoist) {
@@ -374,7 +458,12 @@ function roleChanges(oldRole, newRole) {
   }
 
   if (oldRole.permissions.bitfield !== newRole.permissions.bitfield) {
-    changes.push("Rol izinleri değiştirildi.");
+    const permDiffs = permissionDiff(oldRole.permissions, newRole.permissions);
+    changes.push(...permDiffs);
+  }
+
+  if ((oldRole.position ?? 0) !== (newRole.position ?? 0)) {
+    changes.push(`Pozisyon: **${oldRole.position}** → **${newRole.position}**`);
   }
 
   return changes.length ? changes : ["Rol ayarlarında değişiklik yapıldı."];
@@ -630,14 +719,31 @@ client.on("messageCreate", async (message) => {
       return message.reply("Kullanıcı ID girmelisin. Örnek: `.unban 123456789012345678 sebep`");
     }
 
+    let bannedUser;
     try {
-      await message.guild.bans.fetch(userId);
+      bannedUser = await message.guild.bans.fetch(userId);
     } catch {
       return message.reply("Bu kullanıcı banlı görünmüyor.");
     }
 
     const reason = args.slice(1).join(" ") || "Sebep belirtilmedi.";
-    await message.guild.members.unban(userId, `${reason} | Komutu kullanan: ${message.author.tag}`);
+    await message.guild.members.unban(
+      userId,
+      `${reason} | Komutu kullanan: ${message.author.tag}`
+    );
+
+    const embed = new EmbedBuilder()
+      .setColor(COLORS.green)
+      .setTitle("Kullanıcının Banı Kaldırıldı")
+      .setDescription([
+        `**Banı kaldırılan kişi:** ${formatUser(bannedUser.user || bannedUser)}`,
+        `**Banı kaldıran kişi:** ${formatUser(message.author)}`,
+        `**Sebep:** ${reason}`
+      ].join("\n"))
+      .setThumbnail(getAvatar(bannedUser.user || bannedUser))
+      .setTimestamp();
+
+    await sendLog(message.guild, SETTINGS.banLogName, embed);
 
     return message.reply(`**${userId}** ID'li kullanıcının banı kaldırıldı. Sebep: **${reason}**`);
   }
@@ -760,9 +866,9 @@ client.on("channelCreate", async (channel) => {
 
   const entry = await fetchAuditEntry(channel.guild, AuditLogEvent.ChannelCreate, channel.id, {
     limit: 10,
-    maxAgeMs: 20000,
-    retries: 3,
-    retryDelay: 1000
+    maxAgeMs: 30000,
+    retries: 6,
+    retryDelay: 1500
   });
 
   const executor = entry?.executor || null;
@@ -795,9 +901,9 @@ client.on("channelDelete", async (channel) => {
 
   const entry = await fetchAuditEntry(channel.guild, AuditLogEvent.ChannelDelete, channel.id, {
     limit: 10,
-    maxAgeMs: 20000,
-    retries: 3,
-    retryDelay: 1000
+    maxAgeMs: 30000,
+    retries: 6,
+    retryDelay: 1500
   });
 
   const executor = entry?.executor || null;
@@ -827,15 +933,23 @@ client.on("channelDelete", async (channel) => {
 client.on("channelUpdate", async (oldChannel, newChannel) => {
   if (!newChannel.guild) return;
 
+  const changes = channelChanges(oldChannel, newChannel);
+
+  if (
+    changes.length === 1 &&
+    changes[0] === "Kanal ayarlarında değişiklik yapıldı."
+  ) {
+    return;
+  }
+
   const entry = await fetchAuditEntry(newChannel.guild, AuditLogEvent.ChannelUpdate, newChannel.id, {
-    limit: 10,
-    maxAgeMs: 20000,
-    retries: 3,
-    retryDelay: 1000
+    limit: 20,
+    maxAgeMs: 30000,
+    retries: 8,
+    retryDelay: 1500
   });
 
   const executor = entry?.executor || null;
-  const changes = channelChanges(oldChannel, newChannel);
   const unauthorized = executor && !executor.bot && !isWhitelisted(executor.id);
 
   const embed = new EmbedBuilder()
@@ -862,10 +976,32 @@ client.on("channelUpdate", async (oldChannel, newChannel) => {
           rateLimitPerUser: oldChannel.rateLimitPerUser ?? 0,
           bitrate: oldChannel.bitrate,
           userLimit: oldChannel.userLimit,
-          parent: oldChannel.parentId ?? null
+          parent: oldChannel.parentId ?? null,
+          rtcRegion: oldChannel.rtcRegion ?? null,
+          videoQualityMode: oldChannel.videoQualityMode,
+          defaultAutoArchiveDuration: oldChannel.defaultAutoArchiveDuration
         },
         "Whitelist dışı kanal düzenleme geri alındı"
-      );
+      ).catch(() => null);
+
+      try {
+        const oldOverwrites = oldChannel.permissionOverwrites?.cache;
+        if (oldOverwrites) {
+          for (const overwrite of oldOverwrites.values()) {
+            await newChannel.permissionOverwrites.edit(
+              overwrite.id,
+              {
+                ViewChannel: overwrite.allow.has("ViewChannel"),
+                SendMessages: overwrite.allow.has("SendMessages"),
+                ManageChannels: overwrite.allow.has("ManageChannels"),
+                ManageRoles: overwrite.allow.has("ManageRoles"),
+                Connect: overwrite.allow.has("Connect"),
+                Speak: overwrite.allow.has("Speak")
+              }
+            ).catch(() => null);
+          }
+        }
+      } catch {}
     } catch {}
 
     await banMemberSafe(newChannel.guild, executor.id, "Whitelist dışı kanal düzenleme");
@@ -878,9 +1014,9 @@ client.on("channelUpdate", async (oldChannel, newChannel) => {
 client.on("roleCreate", async (role) => {
   const entry = await fetchAuditEntry(role.guild, AuditLogEvent.RoleCreate, role.id, {
     limit: 10,
-    maxAgeMs: 20000,
-    retries: 3,
-    retryDelay: 1000
+    maxAgeMs: 30000,
+    retries: 6,
+    retryDelay: 1500
   });
 
   const executor = entry?.executor || null;
@@ -910,9 +1046,9 @@ client.on("roleCreate", async (role) => {
 client.on("roleDelete", async (role) => {
   const entry = await fetchAuditEntry(role.guild, AuditLogEvent.RoleDelete, role.id, {
     limit: 10,
-    maxAgeMs: 20000,
-    retries: 3,
-    retryDelay: 1000
+    maxAgeMs: 30000,
+    retries: 6,
+    retryDelay: 1500
   });
 
   const executor = entry?.executor || null;
@@ -940,16 +1076,17 @@ client.on("roleDelete", async (role) => {
 });
 
 client.on("roleUpdate", async (oldRole, newRole) => {
+  const changes = roleChanges(oldRole, newRole);
+
   const entry = await fetchAuditEntry(newRole.guild, AuditLogEvent.RoleUpdate, newRole.id, {
     limit: 10,
-    maxAgeMs: 20000,
-    retries: 3,
-    retryDelay: 1000
+    maxAgeMs: 30000,
+    retries: 6,
+    retryDelay: 1500
   });
 
   const executor = entry?.executor || null;
   const unauthorized = executor && !executor.bot && !isWhitelisted(executor.id);
-  const changes = roleChanges(oldRole, newRole);
 
   const embed = new EmbedBuilder()
     .setColor(unauthorized ? COLORS.red : COLORS.yellow)
@@ -1083,9 +1220,9 @@ client.on("guildMemberUpdate", async (oldMember, newMember) => {
 client.on("guildBanAdd", async (ban) => {
   const entry = await fetchAuditEntry(ban.guild, AuditLogEvent.MemberBanAdd, ban.user.id, {
     limit: 10,
-    maxAgeMs: 20000,
-    retries: 3,
-    retryDelay: 1000
+    maxAgeMs: 30000,
+    retries: 6,
+    retryDelay: 1500
   });
 
   const executor = entry?.executor || null;
@@ -1114,9 +1251,9 @@ client.on("guildBanAdd", async (ban) => {
 client.on("guildMemberRemove", async (member) => {
   const entry = await fetchAuditEntry(member.guild, AuditLogEvent.MemberKick, member.id, {
     limit: 10,
-    maxAgeMs: 15000,
-    retries: 2,
-    retryDelay: 700
+    maxAgeMs: 20000,
+    retries: 4,
+    retryDelay: 1000
   });
 
   if (!entry) return;
